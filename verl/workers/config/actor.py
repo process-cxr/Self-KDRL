@@ -25,91 +25,7 @@ from .engine import FSDPEngineConfig, McoreEngineConfig
 from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
-__all__ = [
-    "SelfDistillationConfig",
-    "PolicyLossConfig",
-    "RouterReplayConfig",
-    "ActorConfig",
-    "FSDPActorConfig",
-    "McoreActorConfig",
-]
-
-
-@dataclass
-class SelfDistillationConfig(BaseConfig):
-    """Configuration for self-distillation loss.
-
-    Args:
-        Distillation is enabled when policy_loss.loss_mode == "sdpo".
-        full_logit_distillation (bool): Whether to use full-logit KL distillation.
-        alpha (float): KL interpolation coefficient. 0.0=forward KL, 1.0=reverse KL, in-between=JSD.
-        success_reward_threshold (float): Minimum sequence reward to be considered successful.
-        teacher_regularization (str): Teacher regularization mode. Options: "ema", "trust-region".
-        teacher_update_rate (float): EMA update rate for teacher weights, or trust-region mixing coefficient.
-        distillation_topk (Optional[int]): If set, use top-k logits for distillation.
-        distillation_add_tail (bool): Whether to add a tail bucket for top-k distillation.
-        max_reprompt_len (int): Maximum length of the reprompted prompt.
-        reprompt_truncation (str): Truncation method for the reprompted prompt (recommended to use "right" or "error").
-        dont_reprompt_on_self_success (bool): Whether to not reprompt on self-success.
-        remove_thinking_from_demonstration (bool): Whether to remove <think>...</think> tags from successful demonstrations before reprompting.
-        is_clip (Optional[float]): Clip value for distillation IS ratio; None disables IS weighting.
-        reprompt_template (str): Template for reprompting. Uses {prompt}, {solution}, {feedback} placeholders.
-        solution_template (str): Template for formatting solution section. Uses {successful_previous_attempt} placeholder.
-        feedback_template (str): Template for formatting feedback section. Uses {feedback_raw} placeholder.
-        include_environment_feedback (bool): Whether to include environment feedback in reprompting for wrong attempts.
-        environment_feedback_only_without_solution (bool): If True, only use feedback when no solution is available (ignore feedback when solution exists).
-        reprompt_template_feedback (str): Template for reprompting with feedback but no solution.
-        reprompt_template_feedback_solution (str): Template for reprompting with both feedback and solution.
-    """
-
-    full_logit_distillation: bool = True
-    alpha: float = 0.0
-    success_reward_threshold: float = 1.0
-    teacher_regularization: str = "ema"
-    teacher_update_rate: float = 0.05
-    distillation_topk: Optional[int] = None
-    distillation_add_tail: bool = True
-    max_reprompt_len: int = 10240
-    reprompt_truncation: str = "right"
-    dont_reprompt_on_self_success: bool = False
-    remove_thinking_from_demonstration: bool = False
-    is_clip: Optional[float] = None
-    reprompt_template: str = (
-        "{prompt}{solution}{feedback}\n\n"
-        "Correctly solve the original question.\n"
-    )
-    solution_template: str = (
-        "\n"
-        "Correct solution:\n\n"
-        "{successful_previous_attempt}\n\n"
-    )
-    feedback_template: str = (
-        "\n"
-        "The following is feedback from your unsuccessful earlier attempt:\n\n"
-        "{feedback_raw}\n\n"
-    )
-    include_environment_feedback: bool = False
-    environment_feedback_only_without_solution: bool = False
-
-    def __post_init__(self):
-        if not 0.0 <= self.alpha <= 1.0:
-            raise ValueError(f"self_distillation.alpha must be in [0,1], got {self.alpha}")
-        valid_teacher_regularization = ["ema", "trust-region"]
-        if self.teacher_regularization not in valid_teacher_regularization:
-            raise ValueError(
-                "self_distillation.teacher_regularization must be one of "
-                f"{valid_teacher_regularization}, got {self.teacher_regularization}"
-            )
-        if not 0.0 <= self.teacher_update_rate <= 1.0:
-            raise ValueError(
-                f"self_distillation.teacher_update_rate must be in [0,1], got {self.teacher_update_rate}"
-            )
-        if self.distillation_topk is not None and self.distillation_topk <= 0:
-            raise ValueError(
-                f"self_distillation.distillation_topk must be a positive integer, got {self.distillation_topk}"
-            )
-        if self.is_clip is not None and self.is_clip <= 0:
-            raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
+__all__ = ["PolicyLossConfig", "RouterReplayConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig"]
 
 
 @dataclass
@@ -148,7 +64,7 @@ class PolicyLossConfig(BaseConfig):
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
 
     Args:
-        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg', 'sdpo'.
+        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg'.
         clip_cov_ratio (float): Ratio of tokens to be clipped for clip-cov loss.
         clip_cov_lb (float): Lower bound for clip-cov loss.
         clip_cov_ub (float): Upper bound for clip-cov loss.
@@ -232,8 +148,6 @@ class ActorConfig(BaseConfig):
     tau_neg: float = 1.05
     calculate_entropy: bool = False
     use_kl_loss: bool = False
-    # Whether to enable PrefixGrouper-based shared-prefix forward
-    use_prefix_grouper: bool = False
     use_torch_compile: bool = True
     kl_loss_coef: float = 0.001
     kl_loss_type: str = "low_var_kl"
@@ -248,7 +162,6 @@ class ActorConfig(BaseConfig):
     rollout_n: int = MISSING  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
-    self_distillation: SelfDistillationConfig = field(default_factory=SelfDistillationConfig)
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
@@ -370,8 +283,6 @@ class FSDPActorConfig(ActorConfig):
     fsdp_config: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     use_remove_padding: bool = False
     use_rollout_log_probs: bool = False
-    calculate_sum_pi_squared: bool = False
-    sum_pi_squared_checkpointing: bool = False
 
     def __post_init__(self):
         """Validate FSDP actor configuration parameters."""

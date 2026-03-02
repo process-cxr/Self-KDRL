@@ -23,8 +23,6 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-import orjson
-
 
 class Tracking:
     """A unified tracking interface for logging experiment data to multiple backends.
@@ -49,7 +47,7 @@ class Tracking:
         "file",
     ]
 
-    def __init__(self, project_name, experiment_name, default_backend: str | list[str] = "console", config=None, group_name=None):
+    def __init__(self, project_name, experiment_name, default_backend: str | list[str] = "console", config=None):
         if isinstance(default_backend, str):
             default_backend = [default_backend]
         for backend in default_backend:
@@ -71,7 +69,7 @@ class Tracking:
             if config and config["trainer"].get("wandb_proxy", None):
                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
             entity = os.environ.get("WANDB_ENTITY", None)
-            wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings, group=group_name)
+            wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
             self.logger["wandb"] = wandb
 
         if "trackio" in default_backend:
@@ -245,11 +243,11 @@ class FileLogger:
             os.makedirs(directory, exist_ok=True)
             self.filepath = os.path.join(directory, f"{self.experiment_name}.jsonl")
             print(f"Creating file logger at {self.filepath}")
-        self.fp = open(self.filepath, "wb", buffering=0)
+        self.fp = open(self.filepath, "w")
 
     def log(self, data, step):
         data = {"step": step, "data": data}
-        self.fp.write(orjson.dumps(data, option=orjson.OPT_SERIALIZE_NUMPY) + b"\n")
+        self.fp.write(json.dumps(data) + "\n")
 
     def finish(self):
         self.fp.close()
@@ -423,6 +421,7 @@ class ValidationGenerationsLogger:
         """Log validation generation to mlflow as artifacts"""
         # https://mlflow.org/docs/latest/api_reference/python_api/mlflow.html?highlight=log_artifact#mlflow.log_artifact
 
+        import json
         import tempfile
 
         import mlflow

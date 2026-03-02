@@ -76,9 +76,6 @@ enable_prefix_caching: True
 # logprobs mode for rollout logprobs
 logprobs_mode: processed_logprobs
 
-# scheduling policy for vllm rollout
-scheduling_policy: fcfs
-
 # Which loader to use for rollout model weights: dummy, hf, megatron, etc.
 # safetensors (for huge model, and set use_shm=True); dummy: randomly init model weight
 load_format: dummy
@@ -288,7 +285,7 @@ skip_tokenizer_init: True
 enable_rollout_routing_replay: False
 
 
-# profile the rollout model in `generate_sequence`
+# profile the rollout model in `generate_sequence` 
 profiler:
 
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs

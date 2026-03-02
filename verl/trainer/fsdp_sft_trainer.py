@@ -720,7 +720,6 @@ class FSDPSFTTrainer:
                 experiment_name=self.config.trainer.experiment_name,
                 default_backend=self.config.trainer.logger,
                 config=OmegaConf.to_container(self.config, resolve=True),
-                group_name=self.config.trainer.get("group_name", None),
             )
 
         global_step = self.resume_global_step  # Start from resumed step

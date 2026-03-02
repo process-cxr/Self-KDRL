@@ -26,6 +26,7 @@ from .core_algos import compute_self_distillation_loss
 from .dp_actor import SDPODataParallelPPOActor, TrustRegionTeacher
 from .sdpo_trainer import RaySDPOTrainer
 from .config import SelfDistillationConfig
+from .fsdp_workers import SDPOActorRolloutRefWorker, AsyncSDPOActorRolloutRefWorker
 
 __all__ = [
     "compute_self_distillation_loss",
@@ -33,4 +34,6 @@ __all__ = [
     "TrustRegionTeacher",
     "RaySDPOTrainer",
     "SelfDistillationConfig",
+    "SDPOActorRolloutRefWorker",
+    "AsyncSDPOActorRolloutRefWorker",
 ]

@@ -25,6 +25,7 @@ Usage:
         data.train_files=datasets/tooluse/train.parquet
 """
 
+import logging
 import os
 import socket
 
@@ -38,6 +39,8 @@ from verl.trainer.ppo.utils import need_reference_policy
 from verl.utils.device import auto_set_device, is_cuda_available
 
 from .sdpo_trainer import RaySDPOTrainer
+
+logger = logging.getLogger(__name__)
 
 
 @hydra.main(config_path="config", config_name="sdpo_trainer", version_base=None)
@@ -106,15 +109,24 @@ class TaskRunner:
 
         from verl.single_controller.ray import RayWorkerGroup
 
+        # SDPO configuration validation
+        self_distillation_cfg = config.actor_rollout_ref.actor.get("self_distillation", None)
+        loss_mode = config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+        self_distillation_needs_ref = self_distillation_cfg is not None and loss_mode == "sdpo"
+
+        if self_distillation_needs_ref and need_reference_policy(None):
+            raise ValueError("SDPO cannot share the reference policy with KL regularization.")
+
         # Define worker classes based on strategy
-        # Note: For SDPO, we need workers that support self-distillation.
-        # The workers in verl already have SDPO support built-in when loss_mode="sdpo".
-        # If you need custom SDPO workers, you can import them here.
+        # For SDPO, we use custom workers that support self-distillation
+        # Note: We use AsyncActorRolloutRefWorker for async rollout (default mode)
         if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
-            from verl.workers.fsdp_workers import ActorRolloutRefWorker
+            from recipe.sdpo.fsdp_workers import AsyncSDPOActorRolloutRefWorker as ActorRolloutRefWorker
             ray_worker_group_cls = RayWorkerGroup
         elif config.actor_rollout_ref.actor.strategy == "megatron":
-            from verl.workers.megatron_workers import ActorRolloutRefWorker
+            from recipe.sdpo.fsdp_workers import AsyncSDPOActorRolloutRefWorker as ActorRolloutRefWorker
+            # TODO: Verify megatron SDPO worker implementation
+            logger.warning("Megatron SDPO worker not fully tested")
             ray_worker_group_cls = RayWorkerGroup
         else:
             raise NotImplementedError(

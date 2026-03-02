@@ -19,6 +19,7 @@ This module provides the SDPO-specific trainer implementation that extends
 verl's RayPPOTrainer with self-distillation capabilities.
 """
 
+import logging
 import re
 from collections import defaultdict
 from typing import Any, Optional
@@ -31,6 +32,8 @@ from verl import DataProto
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, compute_response_mask
 
 from .config import SelfDistillationConfig
+
+logger = logging.getLogger(__name__)
 
 
 class RaySDPOTrainer(RayPPOTrainer):

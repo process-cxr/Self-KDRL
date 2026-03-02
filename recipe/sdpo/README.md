@@ -20,11 +20,13 @@ recipe/sdpo/
 ├── __init__.py              # Module exports
 ├── main_sdpo.py             # Entry point (Hydra + Ray)
 ├── sdpo_trainer.py          # RaySDPOTrainer (extends RayPPOTrainer)
-├── dp_actor.py              # SDPODataParallelPPOActor (extends DataParallelPPOActor)
+├── dp_actor.py              # SDPODataParallelPPOActor + TrustRegionTeacher
+├── fsdp_workers.py          # SDPOActorRolloutRefWorker + AsyncSDPOActorRolloutRefWorker
 ├── core_algos.py            # SDPO loss functions
 ├── config.py                # SelfDistillationConfig dataclass
 ├── config/
-│   └── sdpo_trainer.yaml    # Hydra configuration
+│   ├── sdpo_trainer.yaml    # Hydra configuration
+│   └── runtime_env.yaml     # Ray runtime environment
 ├── reward_score/            # Reward functions with feedback
 │   ├── __init__.py
 │   ├── code.py              # Code reward + LeetCode-style feedback
@@ -61,8 +63,17 @@ RayPPOTrainer (verl)
 
 DataParallelPPOActor (verl)
     └── SDPODataParallelPPOActor (recipe/sdpo)
-            └── Overrides: update_policy()
+            └── Overrides: update_policy(), _forward_micro_batch()
             └── Adds: _update_teacher(), set_teacher_module()
+
+ActorRolloutRefWorker (verl)
+    └── SDPOActorRolloutRefWorker (recipe/sdpo)
+            └── Replaces actor with SDPODataParallelPPOActor
+            └── Adds: _setup_teacher_module()
+
+AsyncActorRolloutRefWorker (verl)
+    └── AsyncSDPOActorRolloutRefWorker (recipe/sdpo)
+            └── Inherits all SDPO features + async methods
 ```
 
 ### Data Flow
@@ -215,11 +226,15 @@ When `distillation_topk=100`:
 
 ## Notes
 
-1. **Worker Compatibility**: The recipe uses verl's built-in workers (`ActorRolloutRefWorker`) which already have SDPO support when `loss_mode="sdpo"`.
+1. **Official verl Compatibility**: The recipe is fully compatible with the official verl codebase and does not modify any verl source files.
 
-2. **Teacher Module**: For EMA teacher, you need a separate teacher model. This is handled by verl's worker initialization.
+2. **Worker Customization**: The recipe uses custom workers (`AsyncSDPOActorRolloutRefWorker`) that extend verl's `AsyncActorRolloutRefWorker` to support SDPO's teacher module and distillation features.
 
-3. **Reward Feedback**: The `reward_score/code.py` provides LeetCode-style feedback for code tasks.
+3. **Teacher Module**: For EMA teacher, the ref policy is used as the teacher model. For trust-region, a `TrustRegionTeacher` wrapper combines ref and student outputs.
+
+4. **Reward Feedback**: The `reward_score/code.py` provides LeetCode-style feedback for code tasks, which can be included in the reprompt template.
+
+5. **Configuration**: All SDPO parameters are defined in `config/sdpo_trainer.yaml` with explicit defaults (no environment variable dependencies).
 
 ## Citation
 

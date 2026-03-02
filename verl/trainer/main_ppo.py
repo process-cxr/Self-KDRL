@@ -126,15 +126,6 @@ class TaskRunner:
         from verl.trainer.ppo.ray_trainer import Role
 
         use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
-        self_distillation_cfg = config.actor_rollout_ref.actor.get("self_distillation", None)
-        loss_mode = config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-        self_distillation_needs_ref = self_distillation_cfg is not None and loss_mode == "sdpo"
-        if self_distillation_needs_ref and need_reference_policy(config):
-            raise ValueError("SDPO cannot share the reference policy with KL regularization.")
-        if self_distillation_needs_ref and use_legacy_worker_impl == "disable":
-            raise ValueError(
-                "SDPO requires the legacy worker implementation to colocate the teacher."
-            )
 
         # use new model engine implementation
         if use_legacy_worker_impl == "disable":
@@ -142,14 +133,9 @@ class TaskRunner:
 
             actor_rollout_cls = ActorRolloutRefWorker
             ray_worker_group_cls = RayWorkerGroup
-
-            lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
-            if lora_rank <= 0:
-                lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
-            ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
             # NOTE: In new model engine, ref policy and actor rollout are in same ActorRolloutRefWorker,
             # while in legacy model engine, ref policy is in a separate ActorRolloutRefWorker.
-            if need_reference_policy(config) and not ref_in_actor:
+            if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
                 role = Role.ActorRolloutRef
             else:
                 role = Role.ActorRollout
@@ -174,9 +160,8 @@ class TaskRunner:
         else:
             raise NotImplementedError
 
-        actor_role = Role.ActorRolloutRef if self_distillation_needs_ref else Role.ActorRollout
-        self.role_worker_mapping[actor_role] = ray.remote(actor_rollout_cls)
-        self.mapping[actor_role] = "global_pool"
+        self.role_worker_mapping[Role.ActorRollout] = ray.remote(actor_rollout_cls)
+        self.mapping[Role.ActorRollout] = "global_pool"
         return actor_rollout_cls, ray_worker_group_cls
 
     def add_critic_worker(self, config):
@@ -264,7 +249,7 @@ class TaskRunner:
         if use_legacy_worker_impl == "disable":
             return
 
-        if need_reference_policy(config):
+        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
             self.mapping[Role.RefPolicy] = "global_pool"
 
@@ -306,7 +291,7 @@ class TaskRunner:
         # validate config
         validate_config(
             config=config,
-            use_reference_policy=need_reference_policy(config),
+            use_reference_policy=need_reference_policy(self.role_worker_mapping),
             use_critic=need_critic(config),
         )
 

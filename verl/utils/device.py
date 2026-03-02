@@ -15,26 +15,19 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-def is_torch_npu_available(check_device=True) -> bool:
+def is_torch_npu_available() -> bool:
     """Check if Ascend NPU is available for PyTorch operations.
 
     Attempts to detect NPU availability by checking for the torch.npu module
     and its is_available() function.
 
-    Args:
-        check_device : only check torch_npu package or strictly check if NPU device is available
-
     Returns:
         bool: True if NPU is available, False otherwise.
     """
     try:
-        if not hasattr(torch, "npu"):
-            return False
-
-        if check_device:
+        if hasattr(torch, "npu") and callable(getattr(torch.npu, "is_available", None)):
             return torch.npu.is_available()
-        else:
-            return True
+        return False
     except ImportError:
         return False
 
@@ -53,7 +46,7 @@ def get_visible_devices_keyword() -> str:
         str: 'CUDA_VISIBLE_DEVICES' if CUDA is available,
             'ASCEND_RT_VISIBLE_DEVICES' otherwise.
     """
-    return "CUDA_VISIBLE_DEVICES" if not is_torch_npu_available(check_device=False) else "ASCEND_RT_VISIBLE_DEVICES"
+    return "CUDA_VISIBLE_DEVICES" if is_cuda_available else "ASCEND_RT_VISIBLE_DEVICES"
 
 
 def get_device_name() -> str:

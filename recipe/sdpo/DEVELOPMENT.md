@@ -64,13 +64,17 @@ recipe/sdpo/
 ├── main_sdpo.py             # 入口脚本 (Hydra + Ray)
 ├── sdpo_trainer.py          # RaySDPOTrainer (继承 RayPPOTrainer)
 │   └── 覆盖: _maybe_build_self_distillation_batch()
-├── dp_actor.py              # SDPODataParallelPPOActor (继承 DataParallelPPOActor)
-│   └── 覆盖: update_policy()
+├── dp_actor.py              # SDPODataParallelPPOActor + TrustRegionTeacher
+│   └── 覆盖: update_policy(), _forward_micro_batch()
 │   └── 新增: _update_teacher(), set_teacher_module()
+├── fsdp_workers.py          # SDPOWorker (继承官方 Worker)
+│   ├── SDPOActorRolloutRefWorker (同步)
+│   └── AsyncSDPOActorRolloutRefWorker (异步)
 ├── core_algos.py            # compute_self_distillation_loss()
 ├── config.py                # SelfDistillationConfig dataclass
 ├── config/
-│   └── sdpo_trainer.yaml    # SDPO 配置
+│   ├── sdpo_trainer.yaml    # SDPO 配置
+│   └── runtime_env.yaml     # Ray 运行环境
 ├── reward_score/
 │   ├── __init__.py
 │   ├── code.py              # 代码奖励 + LeetCode 风格反馈
@@ -144,20 +148,36 @@ def _maybe_build_self_distillation_batch(self, batch, reward_tensor, ...):
 
 ## 修复的问题
 
-在开发过程中发现并修复了以下导入路径问题：
+在开发过程中发现并修复了以下问题：
 
-| 错误路径 | 正确路径 |
-|---------|---------|
-| `verl.utils.tensordict_utils.compute_position_id_with_mask` | `verl.utils.model.compute_position_id_with_mask` |
-| `verl.trainer.ppo.ray_trainer.Role` | `verl.trainer.ppo.utils.Role` |
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 导入路径错误 | `compute_position_id_with_mask` 位置改变 | 修正为 `verl.utils.model.compute_position_id_with_mask` |
+| 导入路径错误 | `Role` 类位置改变 | 修正为 `verl.trainer.ppo.utils.Role` |
+| 配置依赖环境变量 | 使用 `oc.env` 导致配置不友好 | 改为明确的默认值 |
+| Worker 类硬编码 | 官方 verl 硬编码创建 `DataParallelPPOActor` | 创建 `AsyncSDPOActorRolloutRefWorker` 继承官方 Worker |
+| `_forward_micro_batch` 返回值不兼容 | 返回字典，破坏官方接口 | 添加兼容逻辑：无额外参数时返回 `(entropy, log_probs)` tuple |
+| rmpad 路径缺少 topk 处理 | 只支持 non-rmpad 路径 | 添加完整的 rmpad 和 ulysses sp topk 处理 |
+| `TrustRegionTeacher` 未使用 | worker 未正确创建 teacher | 在 worker 的 `__init__` 后创建 `TrustRegionTeacher` |
+| 缺少异步 Worker 支持 | 只实现了同步版本 | 创建 `AsyncSDPOActorRolloutRefWorker` |
+| 配置文件未隔离 | 使用 verl-sdpo 的配置文件 | 合并为单个 `sdpo_trainer.yaml` |
+| `SelfDistillationConfig` 冗余 | 与 YAML 配置重复 | 保留作为类型提示 |
+| 缺少 SDPO 配置检查 | 未检查与 KL regularization 冲突 | 添加 SDPO 配置验证逻辑 |
 
 ---
 
 ## 后续工作
 
-1. **测试运行**: 在有 torch/ray 环境的机器上测试导入和运行
-2. **Worker 集成**: 当前使用 verl 内置的 Worker，如需自定义可进一步扩展
-3. **配置调优**: 根据具体任务调整参数
+1. ✅ **自定义 Worker 集成**: 已完成 - 使用 `AsyncSDPOActorRolloutRefWorker` 替换官方 Worker
+2. ✅ **Top-k 蒸馏支持**: 已完成 - 支持 rmpad 和 ulysses sequence parallel
+3. ✅ **官方 verl 兼容性**: 已完成 - 所有代码基于官方 verl，无需修改 verl 源码
+4. ✅ **配置优化**: 已完成 - 单个配置文件，明确默认值
+
+### 可选扩展
+
+1. **Megatron 支持**: 当前 megatron SDPO worker 未完全测试
+2. **更多奖励函数**: 可根据任务需求添加新的奖励函数
+3. **性能优化**: 可进一步优化 rmpad 路径的 topk 处理效率
 
 ---
 

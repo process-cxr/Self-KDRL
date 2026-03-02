@@ -341,7 +341,7 @@ def register(agent_name: str):
     return decorator
 
 
-class AgentLoopWorker:
+class AgentLoopWorkerBase:
     """Agent loop worker takes a batch of messages and run each message in an agent loop."""
 
     def __init__(
@@ -351,10 +351,10 @@ class AgentLoopWorker:
         reward_router_address: str = None,
     ):
         """Initialize agent loop manager.
+
         Args:
             config (DictConfig): YAML config.
             server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
-            reward_router_address (str): reward router address.
         """
         self.config = config
 
@@ -587,12 +587,7 @@ class AgentLoopWorker:
         if output.routed_experts is not None:
             total_length = input_ids.shape[1]
             length, layer_num, topk_num = output.routed_experts.shape
-            if isinstance(output.routed_experts, np.ndarray):
-                experts_tensor = torch.from_numpy(output.routed_experts)
-            elif isinstance(output.routed_experts, torch.Tensor):
-                experts_tensor = output.routed_experts
-            else:
-                raise TypeError(f"Unsupported type for routed_experts: {type(output.routed_experts)}")
+            experts_tensor = torch.from_numpy(output.routed_experts)
             routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
 
             # Calculate start position: left padding means original prompt starts at the end
@@ -665,10 +660,6 @@ class AgentLoopWorker:
         # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
         # because np.array() only keeps the keys for BatchFeature.
         multi_modal_inputs = dict(multi_modal_inputs.convert_to_tensors("pt"))
-        image_grid_thw = multi_modal_inputs.get("image_grid_thw")
-        if image_grid_thw is not None:
-            images_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
-            multi_modal_inputs["images_seqlens"] = images_seqlens
         return multi_modal_inputs
 
     def _compute_position_ids(self, input_ids, attention_mask, multi_modal_inputs) -> torch.Tensor:
@@ -809,6 +800,22 @@ class AgentLoopWorker:
         )
 
 
+@ray.remote
+class AgentLoopWorker(AgentLoopWorkerBase):
+    """Agent loop worker takes a batch of messages and run each message in an agent loop."""
+
+    def __init__(
+        self, config: DictConfig, server_handles: list[ray.actor.ActorHandle], reward_router_address: str = None
+    ):
+        """Initialize agent loop manager.
+        Args:
+            config (DictConfig): YAML config.
+            server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
+            reward_router_address (str): reward router address.
+        """
+        super().__init__(config, server_handles, reward_router_address)
+
+
 async def get_trajectory_info(step, index, validate):
     """Get trajectory info.
 
@@ -858,7 +865,7 @@ class AgentLoopManager:
         if not hasattr(self, "rollout_replica_class"):
             self.rollout_replica_class = get_rollout_replica_class(self.config.actor_rollout_ref.rollout.name)
         if not hasattr(self, "agent_loop_workers_class"):
-            self.agent_loop_workers_class = ray.remote(AgentLoopWorker)
+            self.agent_loop_workers_class = AgentLoopWorker
 
         self._initialize_llm_servers()
         self._init_agent_loop_workers()
@@ -904,7 +911,7 @@ class AgentLoopManager:
         if rollout_config.prometheus.enable:
             if rollout_config.disable_log_stats:
                 raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
-            update_prometheus_config(rollout_config.prometheus, self.server_addresses, rollout_config.name)
+            update_prometheus_config(rollout_config.prometheus, self.server_addresses)
 
     def _init_agent_loop_workers(self):
         self.agent_loop_workers = []
@@ -916,7 +923,7 @@ class AgentLoopManager:
             node_id = node_ids[i % len(node_ids)]
             self.agent_loop_workers.append(
                 self.agent_loop_workers_class.options(
-                    name=f"agent_loop_worker_{i}" + f"_{uuid4().hex[:8]}",
+                    name=f"agent_loop_worker_{i}",
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id, soft=True
                     ),

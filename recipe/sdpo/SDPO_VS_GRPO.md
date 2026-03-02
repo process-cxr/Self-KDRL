@@ -406,9 +406,11 @@ actor_rollout_ref:
 
 ---
 
+---
+
 ## 六、代码改动清单
 
-### 5.1 GRPO 改动文件
+### 6.1 GRPO 改动文件（官方 verl）
 
 ```
 verl/trainer/ppo/core_algos.py
@@ -418,50 +420,64 @@ verl/trainer/config/baseline_grpo.yaml
   └── 新增: GRPO 配置文件
 ```
 
-### 5.2 SDPO 改动文件
+### 6.2 SDPO 改动文件（recipe 隔离模式）
+
+**Recipe 模式（当前实现）** - 完全独立于 verl 源码：
 
 ```
-verl/trainer/ppo/core_algos.py
-  └── 新增: compute_self_distillation_loss()
+recipe/sdpo/
+├── dp_actor.py
+│   ├── 新增: class TrustRegionTeacher
+│   ├── 新增: class SDPODataParallelPPOActor
+│   │   └── 覆盖: update_policy(), _forward_micro_batch()
+│   │   └── 新增: _update_teacher(), set_teacher_module()
+│
+├── fsdp_workers.py
+│   ├── 新增: class SDPOActorRolloutRefWorker (同步)
+│   └── 新增: class AsyncSDPOActorRolloutRefWorker (异步)
+│
+├── sdpo_trainer.py
+│   ├── 新增: class RaySDPOTrainer
+│   │   └── 覆盖: _maybe_build_self_distillation_batch()
+│   │   └── 新增: _collect_solutions_by_uid()
+│
+├── core_algos.py
+│   └── 新增: compute_self_distillation_loss()
+│
+├── main_sdpo.py
+│   └── 新增: SDPO 配置检查逻辑
+│
+├── config/sdpo_trainer.yaml
+│   └── 新增: SDPO 配置文件
+│
+└── reward_score/
+    ├── code.py (代码奖励 + 反馈)
+    └── tooluse.py (ToolUse 奖励 + 反馈)
+```
 
-  注: compute_optimal_token_baseline_advantage() 不是 SDPO 专属
-      OTB 是独立的优势估计器，GRPO/REINFORCE 等都可使用
+**关键区别**：
+- Recipe 模式：所有 SDPO 代码在 `recipe/sdpo/` 目录，不修改 verl 源码
+- 原始 verl-sdpo 模式：SDPO 代码分散在 `verl/` 目录各处
 
-verl/workers/actor/dp_actor.py
-  ├── 新增: class TrustRegionTeacher
-  ├── 新增: self.teacher_module 属性
-  ├── 新增: _update_teacher()
-  ├── 修改: _forward_micro_batch() (支持 distillation)
-  └── 修改: update_policy() (SDPO 路径)
+### 6.3 依赖官方 verl 的方式
 
-verl/trainer/ppo/ray_trainer.py
-  ├── 新增: _maybe_build_self_distillation_batch()
-  ├── 新增: _collect_solutions_by_uid()
-  ├── 新增: _collect_feedback()
-  ├── 新增: _get_solution()
-  └── 修改: fit() (调用 SDPO 数据构建)
+```
+recipe/sdpo 通过继承扩展官方 verl:
 
-verl/trainer/config/sdpo.yaml
-  └── 新增: SDPO 配置文件
-
-verl/utils/reward_score/feedback/
-  ├── 新增: code.py (代码奖励 + 反馈)
-  └── 新增: tooluse.py (ToolUse 奖励 + 反馈)
-
-verl/workers/config/actor.py
-  └── 新增: SelfDistillationConfig
+┌─────────────────────────────────────────────────────────────┐
+│                   官方 verl (无 SDPO)                        │
+│  ┌─────────────────┐  ┌─────────────────┐                 │
+│  │ RayPPOTrainer   │  │ ActorRolloutRef │                 │
+│  └─────────────────┘  └─────────────────┘                 │
+└─────────────────────────────────────────────────────────────┘
+                          ↓ 继承
+┌─────────────────────────────────────────────────────────────┐
+│                   recipe/sdpo                             │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────┐  │
+│  │ RaySDPOTrainer  │  │ SDPOActorRollout│  │TrustRegion   │  │
+│  └─────────────────┘  │ RefWorker        │  │Teacher        │  │
+│                          └─────────────────┘  └──────────────┘  │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
-
-## 七、参考文献
-
-1. **GRPO**: Group Relative Policy Optimization
-   - DeepSeek-Math: "Towards Mathematical Reasoning with LLMs via Reinforcement Learning"
-
-2. **SDPO**: Self-Distilled Policy Optimization
-   - arXiv:2601.20802: "Reinforcement Learning via Self-Distillation"
-
-3. **JSD**: Jensen-Shannon Divergence
-   - 比 KL 散度更对称、更稳定
-   - α=0.5 时等价于 JS 散度
