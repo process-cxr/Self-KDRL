@@ -1,0 +1,65 @@
+# SDPO Trainer Configuration
+# This configuration extends verl's default PPO trainer with SDPO-specific settings
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# SDPO-specific settings
+actor_rollout_ref:
+  actor:
+    policy_loss:
+      loss_mode: sdpo
+
+    self_distillation:
+      full_logit_distillation: true
+      alpha: 0.5
+      success_reward_threshold: 1.0
+      teacher_regularization: ema
+      teacher_update_rate: 0.05
+      distillation_topk: null
+      distillation_add_tail: true
+      max_reprompt_len: 10240
+      reprompt_truncation: right
+      dont_reprompt_on_self_success: false
+      remove_thinking_from_demonstration: false
+      is_clip: null
+      include_environment_feedback: false
+      environment_feedback_only_without_solution: false
+
+      # Templates
+      reprompt_template: |
+        {prompt}{solution}{feedback}
+
+        Correctly solve the original question.
+
+      solution_template: |
+
+        Correct solution:
+
+        {successful_previous_attempt}
+
+
+      feedback_template: |
+
+        The following is feedback from your unsuccessful earlier attempt:
+
+        {feedback_raw}
+
+
+  rollout:
+    n: 8
+    calculate_log_probs: true
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: false
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+
+data:
+  train_batch_size: 32
+
+trainer:
+  val_before_train: false

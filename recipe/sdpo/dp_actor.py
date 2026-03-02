@@ -1,0 +1,444 @@
+# Copyright 2025 SDPO Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+SDPO Data Parallel Actor.
+
+This module provides the SDPO-specific actor implementation that extends
+verl's DataParallelPPOActor with self-distillation capabilities.
+"""
+
+import logging
+import os
+from types import SimpleNamespace
+from typing import Any, Optional
+
+import torch
+import torch.nn as nn
+
+from verl import DataProto
+from verl.workers.actor import DataParallelPPOActor
+from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.utils.py_functional import append_to_dict
+from verl.utils.device import get_device_id
+from verl.utils.profiler import GPUMemoryLogger
+
+from .core_algos import compute_self_distillation_loss
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+class TrustRegionTeacher(nn.Module):
+    """
+    Trust-region teacher regularization module.
+
+    This module creates a teacher by linearly interpolating between
+    a reference model and a student model, limiting how far the teacher
+    can deviate from the reference.
+
+    Args:
+        ref_module: Reference model (frozen)
+        student_module: Student model (trainable)
+        mix_coef: Mixing coefficient for interpolation
+    """
+
+    def __init__(self, ref_module: nn.Module, student_module: nn.Module, mix_coef: float) -> None:
+        super().__init__()
+        self.ref_module = ref_module
+        self.student_module = student_module
+        self.mix_coef = float(mix_coef)
+
+    def forward(self, *args, **kwargs):
+        """Forward pass with interpolated logits."""
+        ref_out = self.ref_module(*args, **kwargs)
+        student_out = self.student_module(*args, **kwargs)
+
+        ref_logits = ref_out.logits if hasattr(ref_out, "logits") else ref_out[0]
+        student_logits = student_out.logits if hasattr(student_out, "logits") else student_out[0]
+
+        # Linear interpolation: logits = (1 - mix_coef) * ref + mix_coef * student
+        logits = torch.lerp(ref_logits, student_logits, self.mix_coef)
+        return SimpleNamespace(logits=logits)
+
+
+class SDPODataParallelPPOActor(DataParallelPPOActor):
+    """
+    SDPO-specific Data Parallel PPO Actor.
+
+    This class extends verl's DataParallelPPOActor with self-distillation
+    capabilities for SDPO training.
+
+    Key additions:
+    - Teacher module management (EMA or trust-region)
+    - Self-distillation loss computation
+    - Support for top-k distillation
+
+    The actor works in two modes:
+    1. SDPO mode (loss_mode == "sdpo"): Uses self-distillation loss
+    2. Vanilla mode: Falls back to standard PPO loss
+
+    Args:
+        config: Actor configuration (should contain self_distillation section for SDPO)
+        actor_module: The actor model
+        actor_optimizer: Optimizer for the actor (optional, None for reference policy)
+    """
+
+    def __init__(
+        self,
+        config,
+        actor_module: nn.Module,
+        actor_optimizer: Optional[torch.optim.Optimizer] = None,
+    ):
+        super().__init__(config, actor_module, actor_optimizer)
+
+        # SDPO-specific: Teacher module for self-distillation
+        self.teacher_module: Optional[nn.Module] = None
+
+    def set_teacher_module(self, teacher_module: Optional[nn.Module]):
+        """Set the teacher module for self-distillation.
+
+        Args:
+            teacher_module: The teacher model (can be None to use actor as teacher)
+        """
+        self.teacher_module = teacher_module
+
+    def _update_teacher(self) -> None:
+        """Update teacher module using EMA.
+
+        This should be called after each policy update step.
+        The update follows: teacher = (1 - τ) * teacher + τ * student
+        """
+        self_distillation_cfg = getattr(self.config, "self_distillation", None)
+        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+
+        if not self_distillation_cfg or loss_mode != "sdpo":
+            return
+
+        teacher_regularization = getattr(self_distillation_cfg, "teacher_regularization", "ema")
+        if teacher_regularization != "ema":
+            return
+
+        update_rate = getattr(self_distillation_cfg, "teacher_update_rate", 0.0)
+        if update_rate == 0.0:
+            return
+
+        if self.teacher_module is None or self.teacher_module is self.actor_module:
+            raise ValueError("EMA teacher requires a separate teacher_module in the actor worker.")
+
+        with torch.no_grad():
+            for teacher_param, student_param in zip(
+                self.teacher_module.parameters(),
+                self.actor_module.parameters(),
+            ):
+                student_data = student_param.data.to(device=teacher_param.device)
+                teacher_param.data.mul_(1.0 - update_rate).add_(student_data, alpha=update_rate)
+
+    @GPUMemoryLogger(role="sdpo dp actor", logger=logger)
+    def update_policy(self, data: DataProto) -> dict[str, Any]:
+        """
+        Update policy with SDPO support.
+
+        This method extends the base update_policy with self-distillation
+        loss computation when SDPO is enabled.
+
+        Args:
+            data: DataProto containing the batch data with keys:
+                - responses: Response token ids
+                - response_mask: Mask for valid response tokens
+                - input_ids: Full input (prompt + response)
+                - attention_mask: Attention mask
+                - position_ids: Position ids
+                - old_log_probs: Log probs from rollout
+                - advantages: Advantage estimates
+                - teacher_input_ids: (SDPO) Teacher input ids
+                - teacher_attention_mask: (SDPO) Teacher attention mask
+                - teacher_position_ids: (SDPO) Teacher position ids
+                - self_distillation_mask: (SDPO) Mask for samples to distill
+
+        Returns:
+            Dictionary of metrics
+        """
+        # Make sure we are in training mode
+        self.actor_module.train()
+
+        temperature = data.meta_info["temperature"]
+        pad_token_id = data.meta_info.get("pad_token_id", 0)
+        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+
+        self_distillation_enabled = loss_mode == "sdpo"
+        self_distillation_cfg = getattr(self.config, "self_distillation", None)
+
+        if self_distillation_enabled:
+            self_distillation_required_keys = {
+                "teacher_input_ids",
+                "teacher_attention_mask",
+                "teacher_position_ids",
+                "self_distillation_mask",
+            }
+            missing_keys = self_distillation_required_keys - set(data.batch.keys())
+            assert not missing_keys, f"Missing required keys for SDPO: {missing_keys}"
+
+        # Select keys for the batch
+        select_keys = [
+            "responses",
+            "response_mask",
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+            "old_log_probs",
+            "advantages",
+        ]
+
+        if self.config.use_kl_loss:
+            select_keys.append("ref_log_prob")
+
+        if self_distillation_enabled:
+            select_keys.extend(list(self_distillation_required_keys))
+
+        if "rollout_is_weights" in data.batch.keys():
+            select_keys.append("rollout_is_weights")
+
+        if "rollout_log_probs" in data.batch.keys():
+            select_keys.append("rollout_log_probs")
+
+        # Check for multi-modal inputs
+        has_multi_modal_inputs = self._has_non_empty_multi_modal_inputs(
+            data.non_tensor_batch.get("multi_modal_inputs")
+        )
+        non_tensor_select_keys = []
+        if has_multi_modal_inputs:
+            non_tensor_select_keys.append("multi_modal_inputs")
+
+        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+
+        # Split to make minibatch iterator
+        mini_batches = data.split(self.config.ppo_mini_batch_size)
+        on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
+
+        metrics = {
+            "actor/pg_loss": 0.0,
+            "actor/kl_loss": 0.0,
+        }
+        did_update = False
+
+        for _ in range(self.config.ppo_epochs):
+            for batch_idx, mini_batch in enumerate(mini_batches):
+                if self.config.use_dynamic_bsz:
+                    from verl.utils.seqlen_balancing import prepare_dynamic_batch
+                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                else:
+                    self.gradient_accumulation = (
+                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                    )
+                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+
+                self.actor_optimizer.zero_grad()
+
+                for micro_batch in micro_batches:
+                    micro_batch = micro_batch.to(get_device_id())
+                    micro_batch_metrics = {}
+                    model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
+                    response_mask = model_inputs["response_mask"]
+                    old_log_prob = model_inputs["old_log_probs"]
+                    advantages = model_inputs["advantages"]
+
+                    entropy_coeff = self.config.entropy_coeff
+                    loss_agg_mode = self.config.loss_agg_mode
+
+                    calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
+                    self_distillation_mask = (
+                        model_inputs.get("self_distillation_mask") if self_distillation_enabled else None
+                    )
+
+                    if self_distillation_enabled:
+                        assert not has_multi_modal_inputs, "Multi-modal inputs are not supported for distillation"
+
+                    if self.config.use_dynamic_bsz:
+                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                    else:
+                        loss_scale_factor = 1 / self.gradient_accumulation
+
+                    # Determine distillation parameters
+                    teacher_regularization = getattr(self_distillation_cfg, "teacher_regularization", "ema") if self_distillation_cfg else "ema"
+                    if teacher_regularization == "trust-region" and self.config.get("use_fused_kernels", False):
+                        raise ValueError("trust-region teacher requires disabling fused kernels to access logits.")
+
+                    return_all_logps = (
+                        self_distillation_cfg.full_logit_distillation
+                        and not self_distillation_cfg.distillation_topk
+                    ) if self_distillation_cfg else False
+                    distill_topk = (
+                        self_distillation_cfg.distillation_topk
+                        if self_distillation_cfg and self_distillation_cfg.full_logit_distillation
+                        else None
+                    )
+
+                    # Forward pass for student
+                    outputs = self._forward_micro_batch(
+                        model_inputs,
+                        temperature=temperature,
+                        calculate_entropy=calculate_entropy,
+                        return_all_logps=return_all_logps,
+                        distill_topk=distill_topk,
+                    )
+                    log_prob = outputs["log_probs"]
+                    entropy = outputs["entropys"] if calculate_entropy else None
+                    student_all_logps = outputs.get("all_logps") if return_all_logps else None
+                    student_topk_logps = outputs.get("topk_logps") if distill_topk else None
+                    student_topk_indices = outputs.get("topk_indices") if distill_topk else None
+
+                    # Get old_log_prob
+                    if on_policy:
+                        old_log_prob = log_prob.detach()
+                    else:
+                        old_log_prob = model_inputs["old_log_probs"]
+
+                    # Get rollout correction weights
+                    rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+
+                    # Compute loss
+                    if self_distillation_enabled:
+                        # SDPO: Compute teacher outputs and distillation loss
+                        teacher_inputs = {
+                            "responses": model_inputs["responses"],
+                            "input_ids": model_inputs["teacher_input_ids"],
+                            "attention_mask": model_inputs["teacher_attention_mask"],
+                            "position_ids": model_inputs["teacher_position_ids"],
+                        }
+                        teacher_model = self.teacher_module or self.actor_module
+
+                        if teacher_regularization == "trust-region" and (
+                            self.teacher_module is None or self.teacher_module is self.actor_module
+                        ):
+                            raise ValueError(
+                                "trust-region teacher requires a separate teacher_module in the actor worker."
+                            )
+
+                        with torch.no_grad():
+                            teacher_outputs = self._forward_micro_batch(
+                                teacher_inputs,
+                                temperature=temperature,
+                                calculate_entropy=False,
+                                return_all_logps=return_all_logps,
+                                distill_topk=distill_topk,
+                                topk_indices=student_topk_indices,
+                                module=teacher_model,
+                            )
+
+                        teacher_log_prob = teacher_outputs["log_probs"]
+                        teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
+                        teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
+
+                        pg_loss, pg_metrics = compute_self_distillation_loss(
+                            student_log_probs=log_prob,
+                            teacher_log_probs=teacher_log_prob,
+                            response_mask=response_mask,
+                            self_distillation_config=self_distillation_cfg,
+                            old_log_probs=old_log_prob,
+                            student_all_log_probs=student_all_logps,
+                            teacher_all_log_probs=teacher_all_logps,
+                            student_topk_log_probs=student_topk_logps,
+                            teacher_topk_log_probs=teacher_topk_logps,
+                            self_distillation_mask=self_distillation_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+
+                        pg_metrics["self_distillation/empty_target_batch"] = (
+                            self_distillation_mask.sum().item() == 0
+                        )
+                        micro_batch_metrics.update(pg_metrics)
+                    else:
+                        # Vanilla PPO: Use standard policy loss
+                        policy_loss_fn = get_policy_loss_fn(loss_mode)
+
+                        pg_loss, pg_metrics = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+                        micro_batch_metrics.update(pg_metrics)
+
+                    # Compute rollout correction metrics if available
+                    rollout_log_prob = model_inputs.get("rollout_log_probs", None)
+                    if loss_mode != "bypass_mode" and rollout_log_prob is not None:
+                        from verl.trainer.ppo.rollout_corr_helper import compute_rollout_corr_metrics_from_logprobs
+                        rollout_corr_metrics = compute_rollout_corr_metrics_from_logprobs(
+                            log_prob=log_prob,
+                            rollout_log_prob=rollout_log_prob,
+                            response_mask=response_mask,
+                        )
+                        micro_batch_metrics.update(rollout_corr_metrics)
+
+                    # Compute total policy loss
+                    policy_loss = pg_loss
+
+                    # Add entropy bonus
+                    if calculate_entropy and entropy is not None:
+                        entropy_agg = agg_loss(
+                            loss_mat=entropy,
+                            loss_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode
+                        )
+                        micro_batch_metrics["actor/entropy"] = entropy_agg.detach().item()
+                        if entropy_coeff != 0:
+                            policy_loss -= entropy_agg * entropy_coeff
+
+                    # Add KL loss if configured
+                    if self.config.use_kl_loss:
+                        ref_log_prob = model_inputs["ref_log_prob"]
+                        kld = kl_penalty(
+                            logprob=log_prob,
+                            ref_logprob=ref_log_prob,
+                            kl_penalty=self.config.kl_loss_type
+                        )
+                        kl_loss = agg_loss(
+                            loss_mat=kld,
+                            loss_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode
+                        )
+                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                        metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
+                        micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+
+                    # Backward pass
+                    loss = policy_loss * loss_scale_factor
+                    if self.scaler is not None:
+                        self.scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+
+                    metrics["actor/pg_loss"] += pg_loss.detach().item() * loss_scale_factor
+                    append_to_dict(metrics, micro_batch_metrics)
+
+                # Optimizer step
+                grad_norm = self._optimizer_step()
+                if torch.isfinite(grad_norm).item():
+                    did_update = True
+                mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                append_to_dict(metrics, mini_batch_metrics)
+
+        self.actor_optimizer.zero_grad()
+
+        # Update teacher after successful gradient update
+        if did_update:
+            self._update_teacher()
+
+        return metrics
