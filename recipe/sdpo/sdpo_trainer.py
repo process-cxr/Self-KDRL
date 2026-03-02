@@ -31,7 +31,7 @@ from transformers import PreTrainedTokenizer
 from verl import DataProto
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, compute_response_mask
 
-from .config import SelfDistillationConfig
+from config import SelfDistillationConfig
 
 logger = logging.getLogger(__name__)
 

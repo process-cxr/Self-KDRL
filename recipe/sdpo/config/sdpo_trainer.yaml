@@ -1,6 +1,6 @@
 hydra:
   searchpath:
-    - file://verl/trainer/config
+    - file:///home/work/cxr/Self-KDRL/verl/trainer/config
 
 defaults:
   - ppo_trainer
@@ -19,44 +19,43 @@ actor_rollout_ref:
     ppo_mini_batch_size: 32
     policy_loss:
       loss_mode: sdpo
-    self_distillation:
-      full_logit_distillation: true
-      alpha: 0.5
-      success_reward_threshold: 1.0
-      teacher_regularization: ema
-      teacher_update_rate: 0.05
-      max_reprompt_len: 10240
-      reprompt_truncation: right
-      dont_reprompt_on_self_success: false
-      remove_thinking_from_demonstration: false
-      is_clip: 2.0
-      distillation_topk: 100
-      distillation_add_tail: true
-      include_environment_feedback: false
-      environment_feedback_only_without_solution: false
 
-      # Templates
-      reprompt_template: |
-        {prompt}{solution}{feedback}
+  self_distillation:
+    full_logit_distillation: true
+    alpha: 0.5
+    success_reward_threshold: 1.0
+    teacher_regularization: ema
+    teacher_update_rate: 0.05
+    max_reprompt_len: 10240
+    reprompt_truncation: right
+    dont_reprompt_on_self_success: false
+    remove_thinking_from_demonstration: false
+    is_clip: 2.0
+    distillation_topk: 100
+    distillation_add_tail: true
+    include_environment_feedback: false
+    environment_feedback_only_without_solution: false
 
-        Correctly solve the original question.
+    # Templates
+    reprompt_template: |
+      {prompt}{solution}{feedback}
 
-      solution_template: |
+      Correctly solve the original question.
 
-        Correct solution:
+    solution_template: |
 
-        {successful_previous_attempt}
+      Correct solution:
 
+      {successful_previous_attempt}
 
-      feedback_template: |
+    feedback_template: |
 
-        The following is feedback from your unsuccessful earlier attempt:
+      The following is feedback from your unsuccessful earlier attempt:
 
-        {feedback_raw}
+      {feedback_raw}
 
-
-    optim:
-      lr: 1e-5
+  optim:
+    lr: 1e-5
 
   model:
     path: Qwen/Qwen2.5-7B-Instruct

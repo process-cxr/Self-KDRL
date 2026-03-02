@@ -24,8 +24,8 @@ NNODES=1
 N_GPUS_PER_NODE=1
 
 # Model and Data paths
-MODEL_PATH="Qwen/Qwen2.5-7B-Instruct"
-DATA_PATH="datasets/tooluse"
+MODEL_PATH="/home/work/cxr/models/Qwen3-4B"
+DATA_PATH="/home/work/cxr/Self-KDRL/datasets/tooluse"
 TRAIN_FILE="${DATA_PATH}/train.parquet"
 TEST_FILE="${DATA_PATH}/test.parquet"
 
@@ -48,9 +48,18 @@ RAY_ADDRESS="http://localhost:8265"
 # INTERNAL CONFIGURATION - Usually no need to edit
 # =============================================================================
 
+# Get script directory (works from any location)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKING_DIR="${SCRIPT_DIR}"
+RUNTIME_ENV="${WORKING_DIR}/config/runtime_env.yaml"
+
+# Get project root directory (two levels up from script)
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+# Update PYTHONPATH in runtime_env.yaml
+sed -i "s|__PROJECT_ROOT__|${PROJECT_ROOT}|g" "${RUNTIME_ENV}"
+
 PROJECT_NAME="SDPO"
-WORKING_DIR="${PWD}"
-RUNTIME_ENV="${WORKING_DIR}/recipe/sdpo/config/runtime_env.yaml"
 
 # =============================================================================
 # EXPERIMENT NAMING
@@ -84,8 +93,9 @@ echo "==========================================================================
 # =============================================================================
 
 ray job submit --address="${RAY_ADDRESS}" \
+    --no-wait --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
-    -- python3 -m recipe.sdpo.main_sdpo \
+    -- python3 -m main_sdpo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
     data.train_batch_size=${TRAIN_BATCH_SIZE} \

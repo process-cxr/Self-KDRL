@@ -34,7 +34,7 @@ from verl.utils.py_functional import append_to_dict
 from verl.utils.device import get_device_id
 from verl.utils.profiler import GPUMemoryLogger
 
-from .core_algos import compute_self_distillation_loss
+from core_algos import compute_self_distillation_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
