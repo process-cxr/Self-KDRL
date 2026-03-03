@@ -22,6 +22,7 @@ by using SDPODataParallelPPOActor instead of DataParallelPPOActor.
 from omegaconf import OmegaConf, open_dict
 from codetiming import Timer
 import psutil as _psutil  # Imported for memory metrics
+import torch
 
 from verl import DataProto
 from verl.single_controller.base.decorator import register, Dispatch, make_nd_compute_dataproto_dispatch_fn
@@ -247,7 +248,10 @@ class SDPOActorRolloutRefWorker(ActorRolloutRefWorker):
             metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
             self.actor_lr_scheduler.step()
 
-        return metrics
+            # Return DataProto with metrics (following official verl)
+            output = DataProto(meta_info={"metrics": metrics})
+
+        return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")

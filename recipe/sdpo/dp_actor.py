@@ -421,7 +421,7 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                                 rearrange(full_topk_indices, "b s k -> (b s) k"), indices
                             )
                             if self.use_ulysses_sp:
-                                from verl.utils.triton import slice_input_tensor
+                                from verl.utils.ulysses import slice_input_tensor
                                 topk_indices_rmpad = slice_input_tensor(
                                     topk_indices_rmpad.unsqueeze(0), dim=1, padding=True
                                 ).squeeze(0)
@@ -431,7 +431,7 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
 
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:
-                    from verl.utils.triton import gather_outputs_and_unpad
+                    from verl.utils.ulysses import gather_outputs_and_unpad
                     log_probs = gather_outputs_and_unpad(
                         log_probs,
                         gather_dim=0,

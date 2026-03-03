@@ -12,6 +12,7 @@ SDPO is a reinforcement learning algorithm that uses the model's own high-reward
 - **Environment Feedback**: Incorporate rich feedback from the environment (e.g., test case results)
 - **Flexible KL Divergence**: Support for Forward KL, Reverse KL, and JSD
 - **Top-k Distillation**: Memory-efficient distillation using only top-k logits
+- **Isolated from Official verl**: All SDPO code is in `recipe/sdpo/`, no modifications to verl source
 
 ## Directory Structure
 
@@ -28,10 +29,13 @@ recipe/sdpo/
 │   ├── sdpo_trainer.yaml    # Hydra configuration
 │   └── runtime_env.yaml     # Ray runtime environment
 ├── reward_score/            # Reward functions with feedback
-│   ├── __init__.py
+│   ├── __init__.py          # Auto-dispatch reward function
 │   ├── code.py              # Code reward + LeetCode-style feedback
+│   ├── math.py              # Math reward + feedback
+│   ├── gpqa.py              # GPQA reward
+│   ├── mcq.py               # Multiple choice reward
+│   ├── mmlu_pro.py          # MMLU-Pro reward
 │   └── tooluse.py           # ToolUse reward + feedback
-├── run_sdpo.sh              # Launch script
 └── README.md                # This file
 ```
 
@@ -43,13 +47,11 @@ export MODEL_PATH=Qwen/Qwen2.5-7B-Instruct
 export DATA_PATH=datasets/tooluse
 
 # Run SDPO training
-bash recipe/sdpo/run_sdpo.sh my_experiment
-
-# Or directly with Python
 python -m recipe.sdpo.main_sdpo \
     --config-name sdpo_trainer \
     actor_rollout_ref.model.path=$MODEL_PATH \
-    data.train_files=$DATA_PATH/train.parquet
+    data.train_files=$DATA_PATH/train.parquet \
+    data.val_files=$DATA_PATH/test.parquet
 ```
 
 ## Architecture
@@ -59,17 +61,18 @@ python -m recipe.sdpo.main_sdpo \
 ```
 RayPPOTrainer (verl)
     └── RaySDPOTrainer (recipe/sdpo)
-            └── Overrides: _maybe_build_self_distillation_batch()
+            └── Overrides: _update_actor(), _init_sdpo_config(),
+                           _maybe_build_self_distillation_batch()
 
 DataParallelPPOActor (verl)
     └── SDPODataParallelPPOActor (recipe/sdpo)
-            └── Overrides: update_policy(), _forward_micro_batch()
-            └── Adds: _update_teacher(), set_teacher_module()
+            └── Overrides: update_policy(), _forward_micro_batch(), compute_log_prob()
+            └── Adds: _update_teacher(), _has_non_empty_multi_modal_inputs()
 
 ActorRolloutRefWorker (verl)
     └── SDPOActorRolloutRefWorker (recipe/sdpo)
-            └── Replaces actor with SDPODataParallelPPOActor
-            └── Adds: _setup_teacher_module()
+            └── Overrides: init_model(), update_actor(), compute_log_prob()
+            └── Manages: teacher_module setup, self_distillation_cfg passing
 
 AsyncActorRolloutRefWorker (verl)
     └── AsyncSDPOActorRolloutRefWorker (recipe/sdpo)
@@ -83,17 +86,19 @@ AsyncActorRolloutRefWorker (verl)
        ↓
 2. Reward: Compute rewards + collect environment feedback
        ↓
-3. Build Teacher Inputs (RaySDPOTrainer._maybe_build_self_distillation_batch):
-   - Collect successful solutions by UID
-   - Collect environment feedback
+3. Build Teacher Batch (RaySDPOTrainer._update_actor):
+   - Extract reward tensor from batch
+   - Collect successful solutions by UID (reward >= threshold)
+   - Collect environment feedback (if enabled)
    - Build teacher_input_ids: prompt + solution + feedback
+   - Compute self_distillation_mask for samples to distill
        ↓
-4. Advantage: Compute GRPO advantages
+4. Advantage: Compute GRPO advantages (optional, not used in SDPO loss)
        ↓
 5. Update Policy (SDPODataParallelPPOActor.update_policy):
    - Forward student: log_probs from original input
    - Forward teacher: log_probs from teacher_input_ids
-   - Compute JSD loss
+   - Compute distillation loss (JSD/Forward KL/Reverse KL)
    - Backward + EMA update teacher
 ```
 
@@ -103,15 +108,17 @@ Key parameters in `config/sdpo_trainer.yaml`:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `loss_mode` | "sdpo" | Use SDPO loss |
-| `alpha` | 0.5 | KL interpolation: 0=Forward KL, 1=Reverse KL, 0.5=JSD |
-| `success_reward_threshold` | 1.0 | Min reward to consider trajectory successful |
-| `teacher_regularization` | "ema" | Teacher update: "ema" or "trust-region" |
-| `teacher_update_rate` | 0.05 | EMA update rate (τ) |
-| `distillation_topk` | null | Use top-k distillation (null = full vocab) |
-| `is_clip` | null | IS clip threshold |
-| `include_environment_feedback` | false | Include environment feedback in reprompt |
-| `adv_estimator` | "grpo" | Advantage estimator |
+| `loss_mode` | "vanilla" | Set to "sdpo" to enable SDPO |
+| `self_distillation.alpha` | 0.5 | KL interpolation: 0=Forward KL, 1=Reverse KL, 0.5=JSD |
+| `self_distillation.full_logit_distillation` | true | Use full vocab or just token probs |
+| `self_distillation.success_reward_threshold` | 1.0 | Min reward to consider trajectory successful |
+| `self_distillation.teacher_regularization` | "ema" | Teacher update: "ema" or "trust-region" |
+| `self_distillation.teacher_update_rate` | 0.05 | EMA update rate (τ) or mix coef for trust-region |
+| `self_distillation.distillation_topk` | null | Use top-k distillation (null = full vocab) |
+| `self_distillation.distillation_add_tail` | true | Add tail bucket for top-k distillation |
+| `self_distillation.max_reprompt_len` | 10240 | Max length of reprompted teacher input |
+| `self_distillation.include_environment_feedback` | false | Include environment feedback in reprompt |
+| `self_distillation.is_clip` | null | IS clip threshold for distillation |
 
 ### Templates
 
@@ -147,6 +154,11 @@ Extends `RayPPOTrainer`:
 
 ```python
 class RaySDPOTrainer(RayPPOTrainer):
+    def _init_sdpo_config(self):
+        """Initialize SDPO configuration from config."""
+        self.self_distillation_cfg = config.actor_rollout_ref.actor.get("self_distillation", None)
+        self.loss_mode = config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+
     def _maybe_build_self_distillation_batch(self, batch, reward_tensor, reward_extra_infos_dict):
         """Build teacher inputs for SDPO."""
         # 1. Collect successful solutions by UID
@@ -155,13 +167,14 @@ class RaySDPOTrainer(RayPPOTrainer):
         # 2. Collect environment feedback
         feedback_list = self._collect_feedback(...)
 
-        # 3. Build teacher_input_ids
-        teacher_input_ids = tokenizer(teacher_messages, ...)
+        # 3. Build teacher_input_ids with tokenizer
+        teacher_input_ids = tokenizer.apply_chat_template(...)
 
         # 4. Return DataProto with teacher inputs
         return DataProto.from_dict({
             "teacher_input_ids": ...,
             "teacher_attention_mask": ...,
+            "teacher_position_ids": ...,
             "self_distillation_mask": ...,
         }), metrics
 ```
@@ -172,32 +185,86 @@ Extends `DataParallelPPOActor`:
 
 ```python
 class SDPODataParallelPPOActor(DataParallelPPOActor):
+    def __init__(self, config, actor_module, actor_optimizer, self_distillation_cfg):
+        """Initialize with self_distillation configuration."""
+        self._self_distillation_cfg = self_distillation_cfg
+        self.teacher_module = None
+
     def update_policy(self, data):
         """Update with SDPO loss."""
         if self_distillation_enabled:
             # Forward teacher
-            teacher_outputs = self._forward_micro_batch(teacher_inputs, ...)
+            teacher_inputs = {
+                "responses": model_inputs["responses"],
+                "input_ids": model_inputs["teacher_input_ids"],
+                "attention_mask": model_inputs["teacher_attention_mask"],
+                "position_ids": model_inputs["teacher_position_ids"],
+            }
+            with torch.no_grad():
+                teacher_outputs = self._forward_micro_batch(teacher_inputs, module=teacher_model, ...)
 
-            # Compute SDPO loss
-            pg_loss = compute_self_distillation_loss(
-                student_log_probs, teacher_log_probs, ...
+            # Compute SDPO loss (JSD/KL)
+            pg_loss, pg_metrics = compute_self_distillation_loss(
+                student_log_probs=log_prob,
+                teacher_log_probs=teacher_log_prob,
+                response_mask=response_mask,
+                self_distillation_config=self_distillation_cfg,
+                ...
             )
 
         # Backward and update
         loss.backward()
-        self._optimizer_step()
+        grad_norm = self._optimizer_step()
 
         # EMA update teacher
-        self._update_teacher()
+        if did_update:
+            self._update_teacher()
+
+        return metrics
+
+    def _update_teacher(self):
+        """EMA update teacher weights."""
+        for teacher_param, student_param in zip(...):
+            teacher_param.data.mul_(1.0 - update_rate).add_(student_param.data, alpha=update_rate)
+```
+
+### SDPOActorRolloutRefWorker
+
+Extends `ActorRolloutRefWorker`:
+
+```python
+class SDPOActorRolloutRefWorker(ActorRolloutRefWorker):
+    def __init__(self, config, role, **kwargs):
+        """Save self_distillation config before parent init."""
+        self._self_distillation_cfg = config.actor.get("self_distillation", None)
+        # Temporarily remove self_distillation from config (not in official ActorConfig)
+        del config.actor.self_distillation
+        super().__init__(config, role, **kwargs)
+
+    def init_model(self):
+        """Initialize SDPO actor with self_distillation_cfg parameter."""
+        if self._sdpo_loss_mode == "sdpo":
+            self.actor = SDPODataParallelPPOActor(
+                config=actor_cfg,
+                actor_module=self.actor_module_fsdp,
+                actor_optimizer=self.actor_optimizer,
+                self_distillation_cfg=self._self_distillation_cfg,  # Pass as parameter
+            )
+
+        # Setup teacher module after actor creation
+        if teacher_regularization == "trust-region":
+            self.actor.teacher_module = TrustRegionTeacher(...)
+        else:
+            self.actor.teacher_module = self.ref_module_fsdp
 ```
 
 ## Algorithm Details
 
 ### JSD (Jensen-Shannon Divergence)
 
-```
-α = 0.5 (default)
+When `alpha = 0.5` (default):
 
+```
 M = (1-α) * P_student + α * P_teacher
 
 JSD = (1-α) * KL(M || P_student) + α * KL(M || P_teacher)
@@ -215,14 +282,30 @@ When `distillation_topk=100`:
 - Add tail bucket for remaining probability mass
 - Reduces memory from O(vocab_size) to O(k)
 
+## Metrics Explained
+
+When training with SDPO, you'll see these metrics:
+
+| Metric | Description |
+|--------|-------------|
+| `actor/pg_loss` | The SDPO distillation loss (JSD/KL between student and teacher) |
+| `actor/kl_loss` | Traditional KL penalty (0.0 in SDPO mode, since use_kl_loss defaults to False) |
+| `self_distillation/empty_target_batch` | List showing which batches had no successful samples to distill |
+| `self_distillation/success_sample_fraction` | Fraction of samples that had successful solutions |
+| `rollout_corr/*` | Rollout correction metrics (if enabled) |
+
+**Important**: In SDPO mode, `pg_loss` IS the KL loss (student-teacher KL), not the traditional PPO clipped loss.
+
 ## Comparison with Original SDPO
 
-| Aspect | Original (verl/ modifications) | Recipe |
+| Aspect | Original (verl-sdpo modifications) | Recipe |
 |--------|-------------------------------|--------|
 | Code location | Scattered in verl/ | Isolated in recipe/sdpo/ |
 | Maintenance | Hard to update verl | Independent of verl |
 | Reusability | Tightly coupled | Can be used as template |
 | Upstream compatibility | Blocks verl updates | Compatible with verl updates |
+| Config passing | Directly modifies ActorConfig | Passes as parameter |
+| Import paths | Some use wrong imports | All imports correct |
 
 ## Notes
 
@@ -230,11 +313,19 @@ When `distillation_topk=100`:
 
 2. **Worker Customization**: The recipe uses custom workers (`AsyncSDPOActorRolloutRefWorker`) that extend verl's `AsyncActorRolloutRefWorker` to support SDPO's teacher module and distillation features.
 
-3. **Teacher Module**: For EMA teacher, the ref policy is used as the teacher model. For trust-region, a `TrustRegionTeacher` wrapper combines ref and student outputs.
+3. **Teacher Module**:
+   - For EMA teacher: `ref_module_fsdp` is used directly as the teacher
+   - For trust-region: `TrustRegionTeacher` wrapper combines ref and student outputs
+   - The teacher is updated via EMA after each gradient step
 
-4. **Reward Feedback**: The `reward_score/code.py` provides LeetCode-style feedback for code tasks, which can be included in the reprompt template.
+4. **Reward Feedback**: The `reward_score/` module provides reward functions with environment feedback for various tasks (code, math, tooluse, etc.).
 
-5. **Configuration**: All SDPO parameters are defined in `config/sdpo_trainer.yaml` with explicit defaults (no environment variable dependencies).
+5. **Configuration**: All SDPO parameters are under `actor_rollout_ref.actor.self_distillation`, separate from official ActorConfig fields.
+
+6. **Loss Modes**:
+   - `loss_mode="vanilla"`: Standard PPO with clipped loss
+   - `loss_mode="sdpo"`: SDPO with distillation loss
+   - Other modes (gspo, etc.): Passed through to official verl
 
 ## Citation
 
