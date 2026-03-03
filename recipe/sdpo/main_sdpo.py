@@ -38,6 +38,7 @@ from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import need_reference_policy
 from verl.utils.device import auto_set_device, is_cuda_available
 
+from config import SDPOFSDPActorConfig, validate_sdpo_config
 from sdpo_trainer import RaySDPOTrainer
 
 logger = logging.getLogger(__name__)
@@ -109,17 +110,20 @@ class TaskRunner:
 
         from verl.single_controller.ray import RayWorkerGroup
 
-        # SDPO configuration validation
-        self_distillation_cfg = config.actor_rollout_ref.get("self_distillation", None)
+        # SDPO configuration validation (following verl-sdpo)
+        self_distillation_cfg = config.actor_rollout_ref.actor.get("self_distillation", None)
         loss_mode = config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
         self_distillation_needs_ref = self_distillation_cfg is not None and loss_mode == "sdpo"
 
-        # SDPO requires reference policy for self-distillation
-        # Note: role_worker_mapping is not available yet, so we skip this check here
+        # Check for KL conflict (SDPO should not use KL regularization)
+        use_kl_loss = config.actor_rollout_ref.actor.get("use_kl_loss", False)
+        use_kl_in_reward = config.algorithm.get("use_kl_in_reward", False)
+        if self_distillation_needs_ref and (use_kl_loss or use_kl_in_reward):
+            raise ValueError("SDPO cannot share the reference policy with KL regularization.")
 
         # Define worker classes based on strategy
         # For SDPO, we use custom workers that support self-distillation
-        # Note: We use AsyncActorRolloutRefWorker for async rollout (default mode)
+        # Note: We use AsyncSDPOActorRolloutRefWorker for async rollout (default mode)
         if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
             from recipe.sdpo.fsdp_workers import AsyncSDPOActorRolloutRefWorker as ActorRolloutRefWorker
             ray_worker_group_cls = RayWorkerGroup
@@ -133,10 +137,11 @@ class TaskRunner:
                 f"Strategy {config.actor_rollout_ref.actor.strategy} not supported"
             )
 
-        # Build role-worker mapping
+        # Build role-worker mapping (following verl-sdpo logic)
         from verl.trainer.ppo.utils import Role
+        actor_role = Role.ActorRolloutRef if self_distillation_needs_ref else Role.ActorRollout
         role_worker_mapping = {
-            Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
+            actor_role: ray.remote(ActorRolloutRefWorker),
         }
 
         global_pool_id = "global_pool"
@@ -144,7 +149,7 @@ class TaskRunner:
             global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
         }
         mapping = {
-            Role.ActorRollout: global_pool_id,
+            actor_role: global_pool_id,
         }
 
         # Add reward model if enabled
@@ -161,7 +166,9 @@ class TaskRunner:
             mapping[Role.RewardModel] = global_pool_id
 
         # Add reference policy if needed
-        if need_reference_policy(role_worker_mapping):
+        # Note: For SDPO, we use Role.ActorRolloutRef which has built-in ref.
+        # We only add separate RefPolicy worker for non-SDPO cases that need ref.
+        if need_reference_policy(role_worker_mapping) and actor_role != Role.ActorRolloutRef:
             role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
             mapping[Role.RefPolicy] = global_pool_id
 
@@ -179,8 +186,8 @@ class TaskRunner:
             mapping[Role.Critic] = global_pool_id
 
         # Validate config
-        from verl.utils.config import validate_config
-        validate_config(
+        from recipe.sdpo.config import validate_sdpo_config
+        validate_sdpo_config(
             config=config,
             use_reference_policy=need_reference_policy(role_worker_mapping),
             use_critic=config.algorithm.adv_estimator == "gae",

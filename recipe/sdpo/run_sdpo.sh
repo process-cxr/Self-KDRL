@@ -21,7 +21,7 @@ SUFFIX="local_sdpo"
 
 # Hardware settings
 NNODES=1
-N_GPUS_PER_NODE=1
+N_GPUS_PER_NODE=8
 
 # Model and Data paths
 MODEL_PATH="/home/work/cxr/models/Qwen3-4B"
@@ -111,6 +111,7 @@ ray job submit --address="${RAY_ADDRESS}" \
     algorithm.rollout_correction.rollout_is=token \
     trainer.nnodes=${NNODES} \
     trainer.n_gpus_per_node=${N_GPUS_PER_NODE} \
+    trainer.logger=['console'] \
     trainer.project_name="${PROJECT_NAME}" \
     trainer.experiment_name="${EXP_NAME}"
 

@@ -16,13 +16,65 @@
 SDPO Reward Score Module.
 
 This module provides reward computation functions with environment feedback
-for SDPO training.
+for SDPO training. It automatically selects the appropriate reward function
+based on the data_source parameter.
 """
 
-from .code import compute_score as compute_code_score
-from .tooluse import compute_score as compute_tooluse_score
+import sys
+import os
+from typing import Optional
 
+# Add reward_score directory to path for absolute imports
+if __name__ != "__main__":
+    reward_score_dir = os.path.dirname(os.path.abspath(__file__))
+    if reward_score_dir not in sys.path:
+        sys.path.insert(0, reward_score_dir)
+
+
+def compute_score(
+    data_source: str,
+    solution_str: str,
+    ground_truth: str,
+    extra_info: Optional[dict] = None,
+) -> dict:
+    """Compute reward score based on data_source.
+
+    This function acts as a dispatcher, automatically selecting the appropriate
+    reward computation function based on the data_source parameter.
+
+    Args:
+        data_source: The type of dataset/task (e.g., "tooluse", "code", "math", "gpqa")
+        solution_str: The model's response
+        ground_truth: The ground truth answer
+        extra_info: Additional information for reward computation
+
+    Returns:
+        dict: Dictionary containing score and optional metadata
+    """
+    if data_source in ["code", "livecodebench", "humanevalplus"]:
+        # Import dynamically to avoid loading all modules
+        import code
+        return code.compute_score(solution_str, ground_truth, extra_info, sparse_rewards=True, max_test_cases=None)
+    elif data_source in ["math", "math500", "dapo_math", "gsm8k"]:
+        import math
+        return math.compute_score(solution_str, ground_truth, extra_info)
+    elif data_source in ["gpqa"]:
+        import gpqa
+        return gpqa.compute_score(solution_str, ground_truth)
+    elif data_source in ["sciknoweval"]:
+        import mcq
+        return mcq.compute_score(solution_str, ground_truth)
+    elif data_source in ["tooluse"]:
+        import tooluse
+        return tooluse.compute_score(solution_str, ground_truth)
+    elif data_source in ["mmlu_pro"]:
+        import mmlu_pro
+        return mmlu_pro.compute_score(solution_str, ground_truth)
+    else:
+        raise ValueError(f"Reward style {data_source} not found. Available: code, math, gpqa, mcq, tooluse, mmlu_pro")
+
+
+# Backward compatibility: expose individual functions
 __all__ = [
-    "compute_code_score",
-    "compute_tooluse_score",
+    "compute_score",
 ]

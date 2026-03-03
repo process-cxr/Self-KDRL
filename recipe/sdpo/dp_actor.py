@@ -26,15 +26,29 @@ from typing import Any, Optional
 
 import torch
 import torch.nn as nn
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+try:
+    from torch.distributed.tensor import DTensor
+except ImportError:
+    from torch.distributed._tensor import DTensor
+
+import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.workers.actor import DataParallelPPOActor
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
-from verl.utils.py_functional import append_to_dict
-from verl.utils.device import get_device_id
+from verl.trainer.ppo.core_algos import agg_loss, kl_penalty
+from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
+from verl.utils.device import get_device_id, get_device_name
+from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.profiler import GPUMemoryLogger
+from verl.utils.py_functional import append_to_dict
+from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
+from verl.utils.torch_dtypes import PrecisionType
+from verl.utils.torch_functional import logprobs_from_logits
+from verl.utils.ulysses import gather_outputs_and_unpad, slice_input_tensor, ulysses_pad, ulysses_pad_and_slice_inputs
 
-from core_algos import compute_self_distillation_loss
+# Use extended get_policy_loss_fn that supports 'sdpo' mode
+from .core_algos import get_policy_loss_fn, compute_self_distillation_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -100,19 +114,14 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
         config,
         actor_module: nn.Module,
         actor_optimizer: Optional[torch.optim.Optimizer] = None,
+        self_distillation_cfg: Optional[Any] = None,
     ):
         super().__init__(config, actor_module, actor_optimizer)
 
+        # SDPO-specific: Save self_distillation config (may not be in official ActorConfig)
+        self._self_distillation_cfg = self_distillation_cfg or getattr(config, "self_distillation", None)
         # SDPO-specific: Teacher module for self-distillation
         self.teacher_module: Optional[nn.Module] = None
-
-    def set_teacher_module(self, teacher_module: Optional[nn.Module]):
-        """Set the teacher module for self-distillation.
-
-        Args:
-            teacher_module: The teacher model (can be None to use actor as teacher)
-        """
-        self.teacher_module = teacher_module
 
     def _update_teacher(self) -> None:
         """Update teacher module using EMA.
@@ -120,7 +129,7 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
         This should be called after each policy update step.
         The update follows: teacher = (1 - τ) * teacher + τ * student
         """
-        self_distillation_cfg = getattr(self.config, "self_distillation", None)
+        self_distillation_cfg = self._self_distillation_cfg
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
         if not self_distillation_cfg or loss_mode != "sdpo":
@@ -145,6 +154,76 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                 student_data = student_param.data.to(device=teacher_param.device)
                 teacher_param.data.mul_(1.0 - update_rate).add_(student_data, alpha=update_rate)
 
+    @staticmethod
+    def _has_non_empty_multi_modal_inputs(multi_modal_inputs) -> bool:
+        """Check if there are non-empty multi-modal inputs."""
+        if multi_modal_inputs is None:
+            return False
+        for inputs in multi_modal_inputs:
+            if inputs is None:
+                continue
+            inputs = getattr(inputs, "data", inputs)
+            if isinstance(inputs, dict):
+                if not inputs:
+                    continue
+                for value in inputs.values():
+                    if value is None:
+                        continue
+                    if isinstance(value, torch.Tensor) and value.numel() == 0:
+                        continue
+                    return True
+            else:
+                return True
+        return False
+
+    def compute_log_prob(self, data: DataProto, calculate_entropy: bool = False) -> dict[str, torch.Tensor]:
+        """Compute log probability, returns dict for SDPO compatibility."""
+        from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
+
+        micro_batch_size = data.meta_info["micro_batch_size"]
+        temperature = data.meta_info["temperature"]
+        use_dynamic_bsz = data.meta_info.get("use_dynamic_bsz", False)
+        pad_token_id = data.meta_info.get("pad_token_id", 0)
+        has_multi_modal_inputs = self._has_non_empty_multi_modal_inputs(
+            data.non_tensor_batch.get("multi_modal_inputs")
+        )
+
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+
+        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+
+        if use_dynamic_bsz:
+            max_token_len = data.meta_info.get("max_token_len", self.config.ppo_max_token_len_per_gpu) * self.ulysses_sequence_parallel_size
+            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+        else:
+            micro_batches = data.split(micro_batch_size)
+
+        log_probs_lst = []
+        entropy_lst = []
+        for micro_batch in micro_batches:
+            micro_batch = micro_batch.to(get_device_id())
+            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
+            with torch.no_grad():
+                outputs = self._forward_micro_batch(
+                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                )
+            log_probs_lst.append(outputs["log_probs"])
+            if calculate_entropy:
+                entropy_lst.append(outputs["entropys"])
+
+        log_probs = torch.concat(log_probs_lst, dim=0)
+        entropys = None
+        if calculate_entropy:
+            entropys = torch.concat(entropy_lst, dim=0)
+
+        if use_dynamic_bsz:
+            log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
+            if calculate_entropy:
+                entropys = restore_dynamic_batch(entropys, batch_idx_list)
+
+        return {"log_probs": log_probs, "entropys": entropys}
+
     def _forward_micro_batch(
         self,
         micro_batch,
@@ -154,7 +233,7 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
         distill_topk=None,
         topk_indices=None,
         module=None,
-    ):
+    ) -> dict[str, torch.Tensor]:
         """
         Forward pass for micro batch with optional distillation support.
 
@@ -174,10 +253,7 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             module: Custom module to use (e.g., teacher model)
 
         Returns:
-            If no distillation parameters are provided (return_all_logps=False,
-            distill_topk=None, topk_indices=None), returns tuple (entropy, log_probs)
-            for compatibility with official verl.
-            Otherwise, returns dict with keys: log_probs, entropys (optional),
+            Dictionary with keys: log_probs, entropys (optional),
                 all_logps (optional), topk_logps (optional), topk_indices (optional)
         """
         # Use custom module if provided, otherwise use actor_module
@@ -209,8 +285,8 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             return_topk_indices = use_topk and topk_indices is None
 
             if self.use_remove_padding:
-                from verl.utils.model_operations import unpad_input, index_first_axis
-                from verl.utils.triton import ulysses_pad, ulysses_pad_and_slice_inputs
+                from verl.utils.attention_utils import index_first_axis, unpad_input
+                from verl.utils.ulysses import ulysses_pad, ulysses_pad_and_slice_inputs
                 from einops import rearrange
                 from verl.utils.attention_utils import pad_input
 
@@ -305,7 +381,7 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                     if calculate_entropy:
                         entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
                 else:
-                    from verl.utils.model_operations import logprobs_from_logits
+                    from verl.utils.torch_functional import logprobs_from_logits
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                     logits_rmpad.div_(temperature)
 
@@ -455,7 +531,7 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                     if calculate_entropy:
                         entropy = output.entropy
                 else:
-                    from verl.utils.model_operations import logprobs_from_logits
+                    from verl.utils.torch_functional import logprobs_from_logits
                     logits = output.logits
                     logits.div_(temperature)
 
@@ -506,8 +582,13 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                 result["topk_indices"] = topk_indices_out if topk_indices_out is not None else topk_indices
             return result
         else:
-            # Compatible with official verl: return (entropy, log_probs)
-            return entropy, log_probs
+            # Always return dict for SDPO compatibility
+            result = {
+                "log_probs": log_probs,
+            }
+            if calculate_entropy:
+                result["entropys"] = entropy
+            return result
 
     @GPUMemoryLogger(role="sdpo dp actor", logger=logger)
     def update_policy(self, data: DataProto) -> dict[str, Any]:
@@ -542,7 +623,7 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
         self_distillation_enabled = loss_mode == "sdpo"
-        self_distillation_cfg = getattr(self.config, "self_distillation", None)
+        self_distillation_cfg = self._self_distillation_cfg
 
         if self_distillation_enabled:
             self_distillation_required_keys = {

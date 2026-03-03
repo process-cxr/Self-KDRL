@@ -304,3 +304,42 @@ class RaySDPOTrainer(RayPPOTrainer):
             "teacher_position_ids": teacher_position_ids,
             "self_distillation_mask": self_distillation_mask,
         }), metrics
+
+    def _update_actor(self, batch: DataProto) -> DataProto:
+        """Override to build self-distillation batch before updating actor."""
+        if self._sdpo_enabled:
+            # Extract reward tensor from batch
+            if "token_level_rewards" in batch.batch:
+                reward_tensor = batch.batch["token_level_rewards"]
+            elif "token_level_scores" in batch.batch:
+                reward_tensor = batch.batch["token_level_scores"]
+            else:
+                reward_tensor = batch.batch.get("rm_scores", None)
+
+            if reward_tensor is None:
+                logger.warning("No reward tensor found in batch, skipping self-distillation batch build")
+                return super()._update_actor(batch)
+
+            # Extract reward extra infos
+            reward_extra_keys = batch.meta_info.get("reward_extra_keys", [])
+            reward_extra_infos_dict = None
+            if reward_extra_keys:
+                reward_extra_infos_dict = {
+                    key: batch.non_tensor_batch.get(key, None)
+                    for key in reward_extra_keys
+                }
+
+            # Build self-distillation batch
+            sd_batch, sd_metrics = self._maybe_build_self_distillation_batch(
+                batch, reward_tensor, reward_extra_infos_dict
+            )
+
+            if sd_batch is not None:
+                # Merge teacher inputs into the batch
+                for key in ["teacher_input_ids", "teacher_attention_mask", "teacher_position_ids", "self_distillation_mask"]:
+                    if key in sd_batch.batch:
+                        batch.batch[key] = sd_batch.batch[key]
+                # Add sd metrics to batch meta_info
+                batch.meta_info.update({"metrics/sd": sd_metrics})
+
+        return super()._update_actor(batch)

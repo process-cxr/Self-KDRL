@@ -21,7 +21,10 @@ This module defines configuration dataclasses for SDPO.
 from dataclasses import dataclass, field
 from typing import Optional
 
+from omegaconf import MISSING, OmegaConf
+
 from verl.base_config import BaseConfig
+from verl.workers.config.actor import ActorConfig, FSDPActorConfig
 
 
 @dataclass
@@ -107,3 +110,57 @@ class SelfDistillationConfig(BaseConfig):
 
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
+
+
+@dataclass
+class SDPOActorConfig(ActorConfig):
+    """SDPO Actor configuration with self_distillation support.
+
+    This class extends the base ActorConfig to add self_distillation configuration
+    for Self-Distilled Policy Optimization.
+    """
+    self_distillation: SelfDistillationConfig = field(default_factory=SelfDistillationConfig)
+
+
+@dataclass
+class SDPOFSDPActorConfig(FSDPActorConfig):
+    """SDPO FSDP Actor configuration.
+
+    This class extends FSDPActorConfig to add self_distillation configuration
+    for SDPO training with FSDP strategy.
+    """
+    self_distillation: SelfDistillationConfig = field(default_factory=SelfDistillationConfig)
+
+
+def validate_sdpo_config(config, use_reference_policy: bool, use_critic: bool) -> None:
+    """Validate SDPO config.
+
+    This function removes self_distillation temporarily (since official FSDPActorConfig
+    doesn't have it), validates using official validator, then restores and validates self_distillation.
+
+    Args:
+        config: The OmegaConf config to validate.
+        use_reference_policy: is ref policy needed
+        use_critic: is critic needed
+    """
+    from verl.utils.config import validate_config as official_validate_config
+
+    # Temporarily remove self_distillation since official FSDPActorConfig doesn't have it
+    self_distillation_cfg = None
+    if "self_distillation" in config.actor_rollout_ref.actor:
+        self_distillation_cfg = OmegaConf.to_container(config.actor_rollout_ref.actor.self_distillation)
+        OmegaConf.set_struct(config, False)
+        del config.actor_rollout_ref.actor.self_distillation
+        OmegaConf.set_struct(config, True)
+
+    # Use official validate_config for the rest
+    official_validate_config(config, use_reference_policy, use_critic)
+
+    # Restore self_distillation config
+    if self_distillation_cfg is not None:
+        OmegaConf.set_struct(config, False)
+        config.actor_rollout_ref.actor.self_distillation = self_distillation_cfg
+        OmegaConf.set_struct(config, True)
+        # Validate self_distillation config
+        sdpo_cfg = SelfDistillationConfig()
+        OmegaConf.merge(sdpo_cfg, self_distillation_cfg)

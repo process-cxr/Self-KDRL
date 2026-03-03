@@ -27,6 +27,40 @@ import torch.nn.functional as F
 from verl.trainer.ppo.core_algos import agg_loss
 
 
+# Store original get_policy_loss_fn to extend it
+_original_get_policy_loss_fn = None
+
+
+def _get_original_get_policy_loss_fn():
+    """Get the original get_policy_loss_fn from verl.core_algos."""
+    global _original_get_policy_loss_fn
+    if _original_get_policy_loss_fn is None:
+        from verl.trainer.ppo.core_algos import get_policy_loss_fn as _fn
+        _original_get_policy_loss_fn = _fn
+    return _original_get_policy_loss_fn
+
+
+def get_policy_loss_fn(name):
+    """Get policy loss function based on loss mode.
+
+    This extends the original get_policy_loss_fn to support 'sdpo' mode.
+
+    Args:
+        name: Loss mode ('vanilla', 'sdpo', 'gspo', etc.)
+
+    Returns:
+        Policy loss function
+    """
+    if name == "sdpo":
+        # For SDPO, we use vanilla policy loss + separate distillation loss
+        # The distillation loss is computed separately in the actor
+        from verl.trainer.ppo.core_algos import get_policy_loss_fn as _fn
+        return _fn("vanilla")
+    else:
+        from verl.trainer.ppo.core_algos import get_policy_loss_fn as _fn
+        return _fn(name)
+
+
 def compute_self_distillation_loss(
     student_log_probs: torch.Tensor,
     teacher_log_probs: torch.Tensor,
