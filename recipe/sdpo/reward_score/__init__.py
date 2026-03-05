@@ -51,11 +51,11 @@ def compute_score(
     Returns:
         dict: Dictionary containing score and optional metadata
     """
-    if data_source in ["code", "livecodebench", "humanevalplus"]:
+    if data_source in ["code", "livecodebench", "humanevalplus", "codeforces", "code_elo", "mbppplus"]:
         # Import dynamically to avoid loading all modules
         import code
         return code.compute_score(solution_str, ground_truth, extra_info, sparse_rewards=True, max_test_cases=None)
-    elif data_source in ["math", "math500", "dapo_math", "gsm8k"]:
+    elif data_source in ["math", "math500", "dapo_math", "gsm8k", "aime24", "aime25", "amc23"]:
         import math
         return math.compute_score(solution_str, ground_truth, extra_info)
     elif data_source in ["gpqa"]:
@@ -71,7 +71,7 @@ def compute_score(
         import mmlu_pro
         return mmlu_pro.compute_score(solution_str, ground_truth)
     else:
-        raise ValueError(f"Reward style {data_source} not found. Available: code, math, gpqa, mcq, tooluse, mmlu_pro")
+        raise ValueError(f"Reward style {data_source} not found. Available: code, livecodebench, humanevalplus, codeforces, code_elo, mbppplus, math, math500, dapo_math, gsm8k, aime24, aime25, amc23, gpqa, sciknoweval, tooluse, mmlu_pro")
 
 
 # Backward compatibility: expose individual functions

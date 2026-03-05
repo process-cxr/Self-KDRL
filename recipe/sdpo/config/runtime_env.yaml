@@ -3,4 +3,7 @@ excludes: ["/.git/", "/datasets/", "/figures/", "/docs/", "/examples/", "/tests/
 env_vars:
   TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
   CUDA_DEVICE_MAX_CONNECTIONS: "1"
-  PYTHONPATH: "/home/work/cxr/Self-KDRL"  
+  # PYTHONPATH: Update this to your project root path before committing
+  PYTHONPATH: "/home/work/cxr/Self-KDRL"
+  WANDB_INIT_TIMEOUT: "300"
+

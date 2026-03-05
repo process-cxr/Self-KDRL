@@ -249,9 +249,15 @@ class RaySDPOTrainer(RayPPOTrainer):
         # Build teacher prompts
         teacher_messages = [_build_teacher_message(i) for i in range(batch_size)]
 
-        enable_thinking = batch.meta_info.get("enable_thinking", False)
+        # Get enable_thinking from config (same as original verl-sdpo implementation)
+        enable_thinking = (
+            self.config.data.apply_chat_template_kwargs.get("enable_thinking", True)
+            if self.config.data.apply_chat_template_kwargs
+            else True
+        )
         teacher_prompt = self.tokenizer.apply_chat_template(
             teacher_messages,
+            tokenize=True,  # Explicit tokenization (same as original verl-sdpo)
             return_tensors="pt",
             return_dict=True,
             continue_final_message=False,

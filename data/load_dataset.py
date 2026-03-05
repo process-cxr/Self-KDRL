@@ -77,6 +77,9 @@ def load_dataset_hf(
     else:
         ds = ds.map(lambda ex: {"elo": "-" if ex["elo"] is None else ex["elo"]})
 
+    if not "system" in ds.column_names:
+        ds = ds.add_column("system", [""] * len(ds))
+
     # Add correct suffix to each description
     ds = ds.map(lambda ex: {"description": ex["description"] + f" The solution will be evaluated in a {ex['kind']} environment."})
 
